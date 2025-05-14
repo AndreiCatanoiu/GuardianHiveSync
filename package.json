@@ -1,0 +1,24 @@
+{
+  "name": "guardianhivesync",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndreiCatanoiu/GuardianHiveSync.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/AndreiCatanoiu/GuardianHiveSync/issues"
+  },
+  "homepage": "https://github.com/AndreiCatanoiu/GuardianHiveSync#readme",
+  "dependencies": {
+    "firebase-admin": "^13.4.0",
+    "mqtt": "^5.13.0"
+  }
+}
