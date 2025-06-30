@@ -8,9 +8,11 @@ const serviceAccount = require(path.join(
 ));
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
+  databaseURL: 'https://guardianhive-8e3e0-default-rtdb.europe-west1.firebasedatabase.app/' 
 });
-const db = admin.firestore();
-console.log('Firebase Admin initialized.');
+
+const db = admin.database();
+console.log('Firebase Admin initialized with Realtime Database.');
 
 const client = mqtt.connect('mqtt://www.andreicatanoiu.ro', {
   port:     1883,
@@ -24,16 +26,22 @@ client.on('connect', async () => {
   console.log('Connected to MQTT broker');
   
   try {
-    const snapshot = await db.collection('deviceStatus').get();
-    snapshot.forEach(doc => {
-      const data = doc.data();
-      deviceCache.set(doc.id, {
-        status: data.status,
-        lastUpdate: data.lastUpdate?.toMillis() || 0,
-        lastMessageTime: Date.now()
+    const snapshot = await db.ref('devices').once('value');
+    const devicesData = snapshot.val();
+    
+    if (devicesData) {
+      Object.keys(devicesData).forEach(deviceId => {
+        const data = devicesData[deviceId];
+        deviceCache.set(deviceId, {
+          status: data.status,
+          lastUpdate: data.lastUpdate || 0,
+          lastMessageTime: Date.now()
+        });
       });
-    });
-    console.log(`Loaded ${deviceCache.size} devices into cache`);
+      console.log(`Loaded ${deviceCache.size} devices into cache`);
+    } else {
+      console.log('No devices found in database');
+    }
   } catch (err) {
     console.error('Error loading device cache:', err);
   }
@@ -46,65 +54,156 @@ client.on('connect', async () => {
 client.on('error', err => console.error('MQTT Error:', err));
 
 async function logMessage(deviceId, type, payload) {
-  const now = admin.firestore.Timestamp.now();
-  await db.collection('mqtt_messages')
-    .add({ deviceId, type, payload, timestamp: now });
+  const now = Date.now();
+  const messageRef = db.ref('mqtt_messages').push();
+  await messageRef.set({ 
+    deviceId, 
+    type, 
+    payload, 
+    timestamp: now 
+  });
 }
 
 client.on('message', async (topic, payloadBuffer) => {
   const payload     = payloadBuffer.toString();
   const parts       = topic.split('/');
   const deviceId    = parts[4];
-  const messageType = parts[5];      
-  const now         = admin.firestore.Timestamp.now();
+  const messageType = parts[5];
+  const now         = Date.now();
 
   try {
-    if (messageType === 'alerts') {
-      const snap = await db.collection('mqtt_messages')
-        .where('deviceId','==',deviceId)
-        .where('type','==','alerts')
-        .orderBy('timestamp','desc')
-        .limit(1)
-        .get();
-      const lastTs = !snap.empty && snap.docs[0].data().timestamp.toMillis();
-      if (!lastTs || now.toMillis() - lastTs >= 2*60*1000) {
-        await logMessage(deviceId, 'alerts', payload);
-        console.log(`[alerts] saved for ${deviceId}`);
-      } else {
-        console.log(`[alerts] skipped for ${deviceId} (<2min)`);
-      }
-    }
-
-    else if (messageType === 'availability') {
-      const status = payload;
+    if (messageType === 'availability') {
+      let newStatus;
       
+      if (payload === 'alive') {
+        newStatus = 'ONLINE';
+      } else if (payload === 'maintenance') {
+        newStatus = 'MAINTENANCE';
+      } else {
+        newStatus = 'ONLINE';
+      }
+
       const cached = deviceCache.get(deviceId);
       const currentStatus = cached?.status;
       const lastMessageTime = cached?.lastMessageTime || 0;
       const timeSinceLastMessage = Date.now() - lastMessageTime;
-      
-      const statusChanged = currentStatus !== status;
+
+      const statusChanged = currentStatus !== newStatus;
       const needsRevalidation = timeSinceLastMessage >= 2*60*1000;
-      
-      if (statusChanged || needsRevalidation) {
-        if (statusChanged) {
-          await logMessage(deviceId, 'availability', status);
-        }
+
+      if (newStatus === 'MAINTENANCE' || statusChanged || needsRevalidation) {
+        await logMessage(deviceId, 'availability', payload);
         
-        await db.collection('deviceStatus')
-          .doc(deviceId)
-          .set({ status, lastUpdate: now }, { merge: true });
-          
-        console.log(`[availability:${status}] updated for ${deviceId} (${statusChanged ? 'changed' : 'revalidation'})`);
+        await db.ref(`devices/${deviceId}`).update({ 
+          status: newStatus, 
+          lastUpdate: now 
+        });
+
+        console.log(`[availability:${newStatus}] updated for ${deviceId} (payload: ${payload}) - ${statusChanged ? 'changed' : newStatus === 'MAINTENANCE' ? 'forced maintenance' : 'revalidation'}`);
       } else {
-        console.log(`[availability:${status}] no update needed for ${deviceId}`);
+        console.log(`[availability:${newStatus}] no update needed for ${deviceId} (payload: ${payload})`);
       }
-      
+
       deviceCache.set(deviceId, {
-        status,
-        lastUpdate: now.toMillis(),
+        status: newStatus,
+        lastUpdate: now,
         lastMessageTime: Date.now()
       });
+    }
+    
+    else if (messageType === 'alive') {
+      const status = 'ONLINE';
+      const cached = deviceCache.get(deviceId);
+      const currentStatus = cached?.status;
+      const lastMessageTime = cached?.lastMessageTime || 0;
+      const timeSinceLastMessage = Date.now() - lastMessageTime;
+
+      const statusChanged = currentStatus !== status;
+      const needsRevalidation = timeSinceLastMessage >= 2*60*1000;
+
+      if (cached?.status === 'MAINTENANCE') {
+        console.log(`[alive] dispozitiv ${deviceId} este în mentenanță, nu schimbăm statusul.`);
+      } else if (statusChanged || needsRevalidation) {
+        if (statusChanged) {
+          await logMessage(deviceId, 'alive', payload);
+        }
+        await db.ref(`devices/${deviceId}`).update({ 
+          status, 
+          lastUpdate: now 
+        });
+
+        console.log(`[alive:${status}] updated for ${deviceId} (${statusChanged ? 'changed' : 'revalidation'})`);
+      } else {
+        console.log(`[alive:${status}] no update needed for ${deviceId}`);
+      }
+
+      deviceCache.set(deviceId, {
+        status,
+        lastUpdate: now,
+        lastMessageTime: Date.now()
+      });
+    }
+
+    else if (messageType === 'alerts') {
+      const lastAlertSnapshot = await db.ref('mqtt_messages')
+        .orderByChild('deviceId')
+        .equalTo(deviceId)
+        .limitToLast(50) 
+        .once('value');
+      
+      let lastAlertTimestamp = 0;
+      if (lastAlertSnapshot.val()) {
+        const messages = lastAlertSnapshot.val();
+        Object.values(messages).forEach(msg => {
+          if (msg.type === 'alerts' && msg.timestamp > lastAlertTimestamp) {
+            lastAlertTimestamp = msg.timestamp;
+          }
+        });
+      }
+
+      if (!lastAlertTimestamp || now - lastAlertTimestamp >= 2*60*1000) {
+        await logMessage(deviceId, 'alerts', payload);
+        console.log(`[alerts] saved for ${deviceId}`);
+
+        const usersSnapshot = await db.ref('users').once('value');
+        const usersData = usersSnapshot.val();
+        
+        let targetUser = null;
+        if (usersData) {
+          Object.keys(usersData).forEach(userId => {
+            const userData = usersData[userId];
+            if (userData.userDevices && userData.userDevices[deviceId]) {
+              targetUser = { id: userId, data: userData };
+            }
+          });
+        }
+
+        if (targetUser && targetUser.data.fcmToken) {
+          const alertData = {
+            id: '', 
+            deviceId,
+            deviceName: targetUser.data.userDevices[deviceId]?.customName || deviceId,
+            deviceType: '', 
+            message: payload,
+            severity: '', 
+            timestamp: now.toString()
+          };
+
+          await admin.messaging().send({
+            token: targetUser.data.fcmToken,
+            data: alertData,
+            notification: {
+              title: `Security Alert - ${alertData.deviceName}`,
+              body: alertData.message
+            }
+          });
+          console.log(`[alerts] FCM sent to user ${targetUser.id}`);
+        } else {
+          console.log(`[alerts] No FCM token found for device ${deviceId}`);
+        }
+      } else {
+        console.log(`[alerts] skipped for ${deviceId} (<2min)`);
+      }
     }
 
     else if (messageType === 'query') {
@@ -122,24 +221,32 @@ client.on('message', async (topic, payloadBuffer) => {
   }
 });
 
-const MARK_DEAD_INTERVAL_MS = 60 * 1000;    
-const DEAD_THRESHOLD_MS     = 2 * 60 * 1000; 
+const MARK_OFFLINE_INTERVAL_MS = 60 * 1000;    
+const OFFLINE_THRESHOLD_MS     = 2 * 60 * 1000; 
 
 setInterval(async () => {
   try {
-    const now    = admin.firestore.Timestamp.now();
-    const cutoff = admin.firestore.Timestamp.fromMillis(now.toMillis() - DEAD_THRESHOLD_MS);
+    const now = Date.now();
+    const cutoff = now - OFFLINE_THRESHOLD_MS;
 
-    const allDevices = await db.collection('deviceStatus').get();
+    const devicesSnapshot = await db.ref('devices').once('value');
+    const devicesData = devicesSnapshot.val();
     
-    const staleDevices = [];
-    allDevices.forEach(doc => {
-      const data = doc.data();
-      const deviceId = doc.id;
+    if (!devicesData) {
+      console.log('No devices found in database.');
+      return;
+    }
 
-      if (data.lastUpdate && 
-          data.lastUpdate.toMillis() < cutoff.toMillis() && 
-          data.status !== 'dead') {
+    const staleDevices = [];
+    Object.keys(devicesData).forEach(deviceId => {
+      const data = devicesData[deviceId];
+
+      if (
+        data.lastUpdate && 
+        data.lastUpdate < cutoff &&
+        data.status !== 'OFFLINE' &&
+        data.status !== 'MAINTENANCE'  
+      ) {
         staleDevices.push({ id: deviceId, data });
       }
     });
@@ -149,39 +256,35 @@ setInterval(async () => {
       return;
     }
 
-    console.log(`Found ${staleDevices.length} stale devices to mark as dead.`);
+    console.log(`Found ${staleDevices.length} stale devices to mark as OFFLINE.`);
 
-    const BATCH_SIZE = 500;
-    
-    for (let i = 0; i < staleDevices.length; i += BATCH_SIZE) {
-      const batch = db.batch();
-      const batchDevices = staleDevices.slice(i, i + BATCH_SIZE);
-      
-      batchDevices.forEach(({ id: deviceId }) => {
-        const deadRef = db.collection('mqtt_messages').doc();
-        batch.set(deadRef, {
-          deviceId,
-          type:      'dead',
-          payload:   '',
-          timestamp: now
-        });
+    for (const { id: deviceId } of staleDevices) {
+      try {
+        await logMessage(deviceId, 'offline', 'timeout');
         
-        const statusRef = db.collection('deviceStatus').doc(deviceId);
-        batch.update(statusRef, { status: 'dead', lastUpdate: now });
+        await db.ref(`devices/${deviceId}`).update({ 
+          status: 'OFFLINE', 
+          lastUpdate: now 
+        });
 
-        console.log(`[dead] marking ${deviceId} as dead`);
-      });
-      
-      await batch.commit();
-      console.log(`Processed batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(staleDevices.length/BATCH_SIZE)}`);
+        deviceCache.set(deviceId, {
+          status: 'OFFLINE',
+          lastUpdate: now,
+          lastMessageTime: Date.now()
+        });
+
+        console.log(`[offline] marking ${deviceId} as OFFLINE`);
+      } catch (error) {
+        console.error(`Error marking device ${deviceId} as offline:`, error);
+      }
     }
     
-    console.log(`Successfully marked ${staleDevices.length} devices as dead due to inactivity.`);
+    console.log(`Successfully marked ${staleDevices.length} devices as OFFLINE due to inactivity.`);
     
   } catch (error) {
-    console.error('Error in dead device marking interval:', error);
+    console.error('Error in offline device marking interval:', error);
   }
-}, MARK_DEAD_INTERVAL_MS);
+}, MARK_OFFLINE_INTERVAL_MS);
 
 process.on('SIGINT', () => {
   console.log('Received SIGINT. Gracefully shutting down...');
