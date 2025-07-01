@@ -2,19 +2,18 @@
 
 ## Description
 
-GuardianHiveSync is a Node.js application that subscribes to MQTT topics from sensors and logs incoming messages to a Firestore database. It also monitors device status and automatically marks devices as `offline` if they become inactive for a configured period.
+GuardianHiveSync is a Node.js application that subscribes to MQTT topics from sensors and logs incoming messages to a Fireabse Realtime Database. It also monitors device status and automatically marks devices as `offline` if they become inactive for a configured period.
 
 ## Features
 
 * Connects to an MQTT broker and subscribes to sensor topics.
-* Saves various message types (`alerts`, `availability`, `query`, etc.) to the `mqtt_messages` collection in Firestore.
+* Saves various message types (`alerts`, `availability`, `query`, etc.) to the `mqtt_messages` collection in Firebase.
 * Updates device status documents in the `deviceStatus` collection with `online`, `offline`, or `maintenance` states.
 * Automatically marks devices as `offline` if no data is received for more than 2 minutes, logging the events accordingly.
 
 ## Prerequisites
 
 * Node.js v12 or higher
-* A Firebase project with Firestore enabled and a service account key JSON file
 * Access to an MQTT broker
 
 ## Installation
@@ -33,8 +32,7 @@ GuardianHiveSync is a Node.js application that subscribes to MQTT topics from se
 
 ## Configuration
 
-1. Place your Firebase service account JSON file in the project root.
-2. Open `index.js` and update the following if necessary:
+ Open `index.js` and update the following if necessary:
 
    * MQTT broker connection settings (`host`, `port`, `username`, `password`).
    * Subscription topic (default: `senzor/licenta/andrei/catanoiu/+/+`).
@@ -50,14 +48,6 @@ senzor/licenta/andrei/catanoiu/{deviceId}/{messageType}
 * `{deviceId}`: Unique identifier of the device.
 * `{messageType}`: Type of the message (`alerts`, `availability`, `query`, etc.).
 
-## Firestore Schema
-
-* **Collection `mqtt_messages`**: stores incoming messages:
-
-  * `deviceId` (string)
-  * `type` (string)
-  * `payload` (string)
-  * `timestamp` (Firestore Timestamp)
 
 * **Collection `deviceStatus`**: tracks each device's status:
 
