@@ -2,10 +2,8 @@ const path  = require('path');
 const admin = require('firebase-admin');
 const mqtt  = require('mqtt');
 
-const serviceAccount = require(path.join(
-  __dirname,
-  'guardianhive-8e3e0-firebase-adminsdk-fbsvc-ab9a2fc414.json'
-));
+const serviceAccount = require('./guardianhive-8e3e0-firebase-adminsdk-fbsvc-ab9a2fc414.json');
+
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL: 'https://guardianhive-8e3e0-default-rtdb.europe-west1.firebasedatabase.app/' 
@@ -62,6 +60,84 @@ async function logMessage(deviceId, type, payload) {
     payload, 
     timestamp: now 
   });
+}
+
+async function getAllUserFCMTokens(userId) {
+  try {
+    const userSnapshot = await db.ref(`users/${userId}/fcmTokens`).once('value');
+    const fcmTokensData = userSnapshot.val();
+    
+    if (fcmTokensData) {
+      return Object.keys(fcmTokensData).filter(token => fcmTokensData[token] === true);
+    }
+    return [];
+  } catch (error) {
+    console.error(`Error getting FCM tokens for user ${userId}:`, error);
+    return [];
+  }
+}
+
+async function sendNotificationToAllUserDevices(userId, deviceId, alertData) {
+  try {
+    const tokens = await getAllUserFCMTokens(userId);
+    
+    if (tokens.length === 0) {
+      console.log(`[alerts] No FCM tokens found for user ${userId}`);
+      return;
+    }
+
+    const message = {
+      data: {
+        deviceId: deviceId,
+        alertType: 'security',
+        timestamp: Date.now().toString(),
+        ...alertData
+      },
+      notification: {
+        title: `Security Alert - ${alertData.deviceName || 'Unknown device'}`,
+        body: alertData.message || 'Suspicious activity detected'
+      }
+    };
+
+    const responses = await Promise.all(tokens.map(token =>
+      admin.messaging().send({ ...message, token }).then(
+        res => ({ token, success: true }),
+        err => ({ token, success: false, error: err })
+      )
+    ));
+
+    for (const res of responses) {
+      if (!res.success && res.error.code === 'messaging/registration-token-not-registered') {
+        try {
+          await db.ref(`users/${userId}/fcmTokens/${res.token}`).remove();
+          console.log(`[alerts] Token invalid șters: ${res.token.substring(0, 20)}...`);
+        } catch (removeError) {
+          console.error(`[alerts] Error removing invalid token:`, removeError);
+        }
+      } else if (!res.success) {
+        console.error(`[alerts] Failed to send FCM to token ${res.token.substring(0, 20)}...:`, res.error.message);
+      } else {
+        console.log(`[alerts] FCM sent successfully to token: ${res.token.substring(0, 20)}...`);
+      }
+    }
+
+    const results = responses;
+    const successful = results.filter(r => r.success).length;
+    const failed = results.filter(r => !r.success).length;
+
+    console.log(`[alerts] FCM notifications sent to user ${userId}: ${successful} successful, ${failed} failed out of ${tokens.length} total devices`);
+    
+    return {
+      totalTokens: tokens.length,
+      successful,
+      failed,
+      results
+    };
+
+  } catch (error) {
+    console.error(`[alerts] Error sending notifications to user ${userId}:`, error);
+    return { error: error.message };
+  }
 }
 
 client.on('message', async (topic, payloadBuffer) => {
@@ -165,41 +241,92 @@ client.on('message', async (topic, payloadBuffer) => {
         await logMessage(deviceId, 'alerts', payload);
         console.log(`[alerts] saved for ${deviceId}`);
 
+        console.log(`[alerts] Searching for all users with device ${deviceId}...`);
         const usersSnapshot = await db.ref('users').once('value');
         const usersData = usersSnapshot.val();
         
-        let targetUser = null;
+        const targetUsers = [];
         if (usersData) {
           Object.keys(usersData).forEach(userId => {
             const userData = usersData[userId];
-            if (userData.userDevices && userData.userDevices[deviceId]) {
-              targetUser = { id: userId, data: userData };
+            console.log(`[alerts] Checking user ${userId}...`);
+            if (userData.userDevices) {
+              console.log(`[alerts] User ${userId} has userDevices:`, Object.keys(userData.userDevices));
+              if (userData.userDevices[deviceId]) {
+                targetUsers.push({ id: userId, data: userData });
+                console.log(`[alerts] ✓ User ${userId} has device ${deviceId} - adding to notification list`);
+              } else {
+                console.log(`[alerts] ✗ User ${userId} does NOT have device ${deviceId}`);
+              }
+            } else {
+              console.log(`[alerts] ✗ User ${userId} has no userDevices`);
             }
           });
+          console.log(`[alerts] Total users found with device ${deviceId}: ${targetUsers.length}`);
+        } else {
+          console.log(`[alerts] No users data found in database`);
         }
 
-        if (targetUser && targetUser.data.fcmToken) {
-          const alertData = {
-            id: '', 
-            deviceId,
-            deviceName: targetUser.data.userDevices[deviceId]?.customName || deviceId,
-            deviceType: '', 
-            message: payload,
-            severity: '', 
-            timestamp: now.toString()
-          };
-
-          await admin.messaging().send({
-            token: targetUser.data.fcmToken,
-            data: alertData,
-            notification: {
-              title: `Security Alert - ${alertData.deviceName}`,
-              body: alertData.message
+        if (targetUsers.length > 0) {
+          console.log(`[alerts] Found ${targetUsers.length} users with device ${deviceId}`);
+          
+          let totalNotificationsSent = 0;
+          let totalDevicesReached = 0;
+          
+          for (const targetUser of targetUsers) {
+            let deviceName = 'Unknown device';
+            try {
+              const deviceSnapshot = await db.ref(`devices/${deviceId}`).once('value');
+              const deviceData = deviceSnapshot.val();
+              if (deviceData && deviceData.name) {
+                deviceName = targetUser.data.userDevices[deviceId]?.customName || deviceData.name || deviceId;
+              } else {
+                deviceName = targetUser.data.userDevices[deviceId]?.customName || deviceId;
+              }
+            } catch (error) {
+              console.error(`Error getting device name for ${deviceId}:`, error);
             }
-          });
-          console.log(`[alerts] FCM sent to user ${targetUser.id}`);
+
+            let alertData = {
+              deviceName: deviceName,
+              message: 'Suspicious activity detected'
+            };
+
+            try {
+              const parsedPayload = JSON.parse(payload);
+              alertData = {
+                deviceName: deviceName,
+                message: parsedPayload.message || 'Suspicious activity detected',
+                alertType: parsedPayload.type || 'security',
+                location: parsedPayload.location || '',
+                severity: parsedPayload.severity || 'medium'
+              };
+            } catch (parseError) {
+              alertData.message = payload || 'Suspicious activity detected';
+            }
+
+            try {
+              const notificationResult = await sendNotificationToAllUserDevices(
+                targetUser.id, 
+                deviceId, 
+                alertData
+              );
+
+              if (notificationResult.error) {
+                console.log(`[alerts] Error sending notifications to user ${targetUser.id}: ${notificationResult.error}`);
+              } else {
+                totalNotificationsSent += notificationResult.successful;
+                totalDevicesReached += notificationResult.totalTokens;
+                console.log(`[alerts] Notifications sent to user ${targetUser.id}: ${notificationResult.successful}/${notificationResult.totalTokens} devices`);
+              }
+            } catch (error) {
+              console.error(`[alerts] Error processing notifications for user ${targetUser.id}:`, error);
+            }
+          }
+
+          console.log(`[alerts] TOTAL: ${totalNotificationsSent} notifications sent across ${totalDevicesReached} devices for ${targetUsers.length} users`);
         } else {
-          console.log(`[alerts] No FCM token found for device ${deviceId}`);
+          console.log(`[alerts] No users found for device ${deviceId}`);
         }
       } else {
         console.log(`[alerts] skipped for ${deviceId} (<2min)`);
