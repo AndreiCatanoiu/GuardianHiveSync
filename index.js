@@ -383,10 +383,9 @@ setInterval(async () => {
       const data = devicesData[deviceId];
 
       if (
-        data.lastUpdate && 
+        data.lastUpdate &&
         data.lastUpdate < cutoff &&
-        data.status !== 'OFFLINE' &&
-        data.status !== 'MAINTENANCE'  
+        data.status !== 'OFFLINE'
       ) {
         staleDevices.push({ id: deviceId, data });
       }
