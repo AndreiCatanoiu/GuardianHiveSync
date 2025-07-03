@@ -149,14 +149,20 @@ client.on('message', async (topic, payloadBuffer) => {
 
   try {
     if (messageType === 'availability') {
-      let newStatus;
       
-      if (payload === 'alive') {
-        newStatus = 'ONLINE';
-      } else if (payload === 'maintenance') {
-        newStatus = 'MAINTENANCE';
-      } else {
-        newStatus = 'ONLINE';
+      let newStatus;
+      const trimmedPayload = payload.replace(/[\u0000-\u001F\u007F]/g, '');
+      
+      switch (trimmedPayload) {
+        case 'alive':
+          newStatus = 'ONLINE';
+          break;
+        case 'maintenance':
+          newStatus = 'MAINTENANCE';
+          break;
+        default:
+          newStatus = 'ONLINE';
+          break;
       }
 
       const cached = deviceCache.get(deviceId);
@@ -167,7 +173,7 @@ client.on('message', async (topic, payloadBuffer) => {
       const statusChanged = currentStatus !== newStatus;
       const needsRevalidation = timeSinceLastMessage >= 2*60*1000;
 
-      if (newStatus === 'MAINTENANCE' || statusChanged || needsRevalidation) {
+      if (statusChanged || needsRevalidation) {
         await logMessage(deviceId, 'availability', payload);
         
         await db.ref(`devices/${deviceId}`).update({ 
@@ -188,8 +194,18 @@ client.on('message', async (topic, payloadBuffer) => {
     }
     
     else if (messageType === 'alive') {
-      const status = 'ONLINE';
       const cached = deviceCache.get(deviceId);
+      
+      if (cached?.status === 'MAINTENANCE') {
+        console.log(`[alive] Device ${deviceId} is in MAINTENANCE mode, ignoring alive message.`);
+        deviceCache.set(deviceId, {
+          ...cached,
+          lastMessageTime: Date.now()
+        });
+        return;
+      }
+      
+      const status = 'ONLINE';
       const currentStatus = cached?.status;
       const lastMessageTime = cached?.lastMessageTime || 0;
       const timeSinceLastMessage = Date.now() - lastMessageTime;
@@ -197,9 +213,7 @@ client.on('message', async (topic, payloadBuffer) => {
       const statusChanged = currentStatus !== status;
       const needsRevalidation = timeSinceLastMessage >= 2*60*1000;
 
-      if (cached?.status === 'MAINTENANCE') {
-        console.log(`[alive] dispozitiv ${deviceId} este în mentenanță, nu schimbăm statusul.`);
-      } else if (statusChanged || needsRevalidation) {
+      if (statusChanged || needsRevalidation) {
         if (statusChanged) {
           await logMessage(deviceId, 'alive', payload);
         }
